@@ -3,7 +3,64 @@ import { WASocket, proto } from '@whiskeysockets/baileys';
 import { pino } from 'pino';
 import { db } from './database';
 
-const logger = pino({ level: 'debug' });
+// Suppress Baileys debug output (Closing session spam)
+const logger = pino({
+    level: process.argv.includes('--debug') ? 'debug' : 'silent'
+});
+
+/**
+ * Logger utility for debug and normal mode
+ */
+class TrackerLogger {
+    private isDebugMode: boolean;
+
+    constructor(debugMode: boolean = false) {
+        this.isDebugMode = debugMode;
+    }
+
+    setDebugMode(enabled: boolean) {
+        this.isDebugMode = enabled;
+    }
+
+    debug(...args: any[]) {
+        if (this.isDebugMode) {
+            console.log(...args);
+        }
+    }
+
+    info(...args: any[]) {
+        console.log(...args);
+    }
+
+    formatDeviceState(jid: string, rtt: number, avgRtt: number, median: number, threshold: number, state: string) {
+        const stateColor = state === 'Online' ? '🟢' : state === 'Standby' ? '🟡' : state === 'OFFLINE' ? '🔴' : '⚪';
+        const timestamp = new Date().toLocaleTimeString('de-DE');
+
+        // Box width is 64 characters, inner content is 62 characters (excluding ║ on both sides)
+        const boxWidth = 62;
+
+        const header = `${stateColor} Device Status Update - ${timestamp}`;
+        const jidLine = `JID:        ${jid}`;
+        const statusLine = `Status:     ${state}`;
+        const rttLine = `RTT:        ${rtt}ms`;
+        const avgLine = `Avg (3):    ${avgRtt.toFixed(0)}ms`;
+        const medianLine = `Median:     ${median.toFixed(0)}ms`;
+        const thresholdLine = `Threshold:  ${threshold.toFixed(0)}ms`;
+
+        console.log(`\n╔════════════════════════════════════════════════════════════════╗`);
+        console.log(`║ ${header.padEnd(boxWidth)} ║`);
+        console.log(`╠════════════════════════════════════════════════════════════════╣`);
+        console.log(`║ ${jidLine.padEnd(boxWidth)} ║`);
+        console.log(`║ ${statusLine.padEnd(boxWidth)} ║`);
+        console.log(`║ ${rttLine.padEnd(boxWidth)} ║`);
+        console.log(`║ ${avgLine.padEnd(boxWidth)} ║`);
+        console.log(`║ ${medianLine.padEnd(boxWidth)} ║`);
+        console.log(`║ ${thresholdLine.padEnd(boxWidth)} ║`);
+        console.log(`╚════════════════════════════════════════════════════════════════╝\n`);
+    }
+}
+
+const trackerLogger = new TrackerLogger();
 
 /**
  * Metrics tracked per device for activity monitoring
@@ -42,10 +99,11 @@ export class WhatsAppTracker {
     private lastPresence: string | null = null;
     public onUpdate?: (data: any) => void;
 
-    constructor(sock: WASocket, targetJid: string) {
+    constructor(sock: WASocket, targetJid: string, debugMode: boolean = false) {
         this.sock = sock;
         this.targetJid = targetJid;
         this.trackedJids.add(targetJid);
+        trackerLogger.setDebugMode(debugMode);
     }
 
     /**
@@ -55,7 +113,7 @@ export class WhatsAppTracker {
     public async startTracking() {
         if (this.isTracking) return;
         this.isTracking = true;
-        logger.info(`Starting tracking for ${this.targetJid}`);
+        trackerLogger.info(`\n✅ Tracking started for ${this.targetJid}\n`);
 
         // Listen for message updates (receipts)
         this.sock.ev.on('messages.update', (updates) => {
@@ -69,17 +127,17 @@ export class WhatsAppTracker {
 
         // Listen for presence updates
         this.sock.ev.on('presence.update', (update) => {
-            console.log('[PRESENCE] Raw update received:', JSON.stringify(update, null, 2));
+            trackerLogger.debug('[PRESENCE] Raw update received:', JSON.stringify(update, null, 2));
 
             if (update.presences) {
                 for (const [jid, presenceData] of Object.entries(update.presences)) {
                     if (presenceData && presenceData.lastKnownPresence) {
                         // Track multi-device JIDs (including LID)
                         this.trackedJids.add(jid);
-                        console.log(`[MULTI-DEVICE] Added JID to tracking: ${jid}`);
+                        trackerLogger.debug(`[MULTI-DEVICE] Added JID to tracking: ${jid}`);
 
                         this.lastPresence = presenceData.lastKnownPresence;
-                        console.log(`[PRESENCE] Stored presence from ${jid}: ${this.lastPresence}`);
+                        trackerLogger.debug(`[PRESENCE] Stored presence from ${jid}: ${this.lastPresence}`);
                         break;
                     }
                 }
@@ -89,10 +147,10 @@ export class WhatsAppTracker {
         // Subscribe to presence updates
         try {
             await this.sock.presenceSubscribe(this.targetJid);
-            console.log(`[PRESENCE] Successfully subscribed to presence for ${this.targetJid}`);
-            console.log(`[MULTI-DEVICE] Currently tracking JIDs: ${Array.from(this.trackedJids).join(', ')}`);
+            trackerLogger.debug(`[PRESENCE] Successfully subscribed to presence for ${this.targetJid}`);
+            trackerLogger.debug(`[MULTI-DEVICE] Currently tracking JIDs: ${Array.from(this.trackedJids).join(', ')}`);
         } catch (err) {
-            console.error('[PRESENCE] Error subscribing to presence:', err);
+            trackerLogger.debug('[PRESENCE] Error subscribing to presence:', err);
         }
 
         // Send initial state update
@@ -149,15 +207,32 @@ export class WhatsAppTracker {
                 }
             };
 
-            console.log(`[PROBE] Sending probe with reaction "${randomReaction}" to non-existent message ${randomMsgId}`);
+            trackerLogger.debug(`[PROBE] Sending probe with reaction "${randomReaction}" to non-existent message ${randomMsgId}`);
             const result = await this.sock.sendMessage(this.targetJid, reactionMessage);
             const startTime = Date.now();
 
             if (result?.key?.id) {
-                console.log(`[PROBE] Probe sent successfully, message ID: ${result.key.id}`);
+                trackerLogger.debug(`[PROBE] Probe sent successfully, message ID: ${result.key.id}`);
                 this.probeStartTimes.set(result.key.id, startTime);
+
+                // Set timeout: if no CLIENT ACK within 10 seconds, mark device as OFFLINE
+                const timeoutId = setTimeout(() => {
+                    if (this.probeStartTimes.has(result.key.id!)) {
+                        const elapsedTime = Date.now() - startTime;
+                        trackerLogger.debug(`[PROBE TIMEOUT] No CLIENT ACK for ${result.key.id} after ${elapsedTime}ms - Device is OFFLINE`);
+                        this.probeStartTimes.delete(result.key.id!);
+                        this.probeTimeouts.delete(result.key.id!);
+
+                        // Mark device as OFFLINE due to no response
+                        if (result.key.remoteJid) {
+                            this.markDeviceOffline(result.key.remoteJid, elapsedTime);
+                        }
+                    }
+                }, 10000); // 10 seconds timeout
+
+                this.probeTimeouts.set(result.key.id, timeoutId);
             } else {
-                console.log('[PROBE ERROR] Failed to get message ID from send result');
+                trackerLogger.debug('[PROBE ERROR] Failed to get message ID from send result');
             }
         } catch (err) {
             logger.error(err, '[PROBE ERROR] Failed to send probe message');
@@ -175,14 +250,16 @@ export class WhatsAppTracker {
 
         if (!msgId || !fromJid) return;
 
-        console.log(`[TRACKING] Message Update - ID: ${msgId}, JID: ${fromJid}, Status: ${status} (${this.getStatusName(status)})`);
+        trackerLogger.debug(`[TRACKING] Message Update - ID: ${msgId}, JID: ${fromJid}, Status: ${status} (${this.getStatusName(status)})`);
 
+        // Only CLIENT ACK (3) means device is online and received the message
+        // SERVER ACK (2) only means server received it, not the device
         if (status === 3) { // CLIENT ACK
             const startTime = this.probeStartTimes.get(msgId);
 
             if (startTime) {
                 const rtt = Date.now() - startTime;
-                console.log(`[TRACKING] ✅ CLIENT ACK received for ${msgId} from ${fromJid}, RTT: ${rtt}ms`);
+                trackerLogger.debug(`[TRACKING] ✅ CLIENT ACK received for ${msgId} from ${fromJid}, RTT: ${rtt}ms`);
 
                 // Clear timeout
                 const timeoutId = this.probeTimeouts.get(msgId);
@@ -194,7 +271,7 @@ export class WhatsAppTracker {
                 this.probeStartTimes.delete(msgId);
                 this.addMeasurementForDevice(fromJid, rtt);
             } else {
-                console.log(`[TRACKING] ⚠️ CLIENT ACK for ${msgId} from ${fromJid} but no start time found (not our probe or already processed)`);
+                trackerLogger.debug(`[TRACKING] ⚠️ CLIENT ACK for ${msgId} from ${fromJid} but no start time found (not our probe or already processed)`);
             }
         }
     }
@@ -209,6 +286,32 @@ export class WhatsAppTracker {
             case 5: return 'PLAYED';
             default: return 'UNKNOWN';
         }
+    }
+
+    /**
+     * Mark a device as OFFLINE when no CLIENT ACK is received
+     * @param jid Device JID
+     * @param timeout Time elapsed before timeout
+     */
+    private markDeviceOffline(jid: string, timeout: number) {
+        // Initialize device metrics if not exists
+        if (!this.deviceMetrics.has(jid)) {
+            this.deviceMetrics.set(jid, {
+                rttHistory: [],
+                recentRtts: [],
+                state: 'OFFLINE',
+                lastRtt: timeout,
+                lastUpdate: Date.now()
+            });
+        } else {
+            const metrics = this.deviceMetrics.get(jid)!;
+            metrics.state = 'OFFLINE';
+            metrics.lastRtt = timeout;
+            metrics.lastUpdate = Date.now();
+        }
+
+        trackerLogger.info(`\n🔴 Device ${jid} marked as OFFLINE (no CLIENT ACK after ${timeout}ms)\n`);
+        this.sendUpdate();
     }
 
     /**
@@ -231,6 +334,7 @@ export class WhatsAppTracker {
         const metrics = this.deviceMetrics.get(jid)!;
         const previousState = metrics.state;
 
+        // Only add measurements if we actually received a CLIENT ACK (rtt <= 5000ms)
         if (rtt <= 5000) {
             // 1. Add to device's recent RTTs for moving average (last 3)
             metrics.recentRtts.push(rtt);
@@ -238,7 +342,7 @@ export class WhatsAppTracker {
                 metrics.recentRtts.shift();
             }
 
-            // 2. Add to device's history for calibration (last 50), filtering outliers > 5000ms
+            // 2. Add to device's history for calibration (last 2000), filtering outliers > 5000ms
             metrics.rttHistory.push(rtt);
             if (metrics.rttHistory.length > 2000) {
                 metrics.rttHistory.shift();
@@ -251,13 +355,12 @@ export class WhatsAppTracker {
             }
 
             metrics.lastRtt = rtt;
-        } else {
-            // RTT > 5000ms indicates device is OFFLINE
-            metrics.lastRtt = rtt;
-            metrics.state = 'OFFLINE';
-            console.log(`[DEVICE ${jid}] RTT: ${rtt}ms > 5000ms - Marking as OFFLINE`);
+            metrics.lastUpdate = Date.now();
+
+            // Determine new state based on RTT
+            this.determineDeviceState(jid);
         }
-        metrics.lastUpdate = Date.now();
+        // If rtt > 5000ms, it means timeout - device is already marked as OFFLINE by markDeviceOffline()
 
         this.determineDeviceState(jid);
 
@@ -284,11 +387,17 @@ export class WhatsAppTracker {
         const metrics = this.deviceMetrics.get(jid);
         if (!metrics) return;
 
-        // If marked OFFLINE due to high RTT (> 5000ms), keep that state
-        // Note: We only stay in OFFLINE if the CURRENT RTT is still > 5000ms
-        if (metrics.state === 'OFFLINE' && metrics.lastRtt > 5000) {
-            console.log(`[DEVICE ${jid}] Maintaining OFFLINE state (RTT: ${metrics.lastRtt}ms)`);
-            return;
+        // If device is marked as OFFLINE (no CLIENT ACK received), keep that state
+        // Only change back to Online/Standby if we receive new measurements
+        if (metrics.state === 'OFFLINE') {
+            // Check if this is a new measurement (device came back online)
+            if (metrics.lastRtt <= 5000 && metrics.recentRtts.length > 0) {
+                trackerLogger.debug(`[DEVICE ${jid}] Device came back online (RTT: ${metrics.lastRtt}ms)`);
+                // Continue with normal state determination below
+            } else {
+                trackerLogger.debug(`[DEVICE ${jid}] Maintaining OFFLINE state`);
+                return;
+            }
         }
 
         // Calculate device's moving average
@@ -307,7 +416,7 @@ export class WhatsAppTracker {
             threshold = median * 0.9;
 
             if (movingAvg < threshold) {
-                metrics.state = 'An (Online)';
+                metrics.state = 'Online';
             } else {
                 metrics.state = 'Standby';
             }
@@ -315,7 +424,11 @@ export class WhatsAppTracker {
             metrics.state = 'Calibrating...';
         }
 
-        console.log(`[DEVICE ${jid}] RTT: ${metrics.lastRtt}ms | Avg(3): ${movingAvg.toFixed(0)}ms | Global Median: ${median.toFixed(0)}ms | Threshold: ${threshold.toFixed(0)}ms | State: ${metrics.state}`);
+        // Normal mode: Formatted output
+        trackerLogger.formatDeviceState(jid, metrics.lastRtt, movingAvg, median, threshold, metrics.state);
+
+        // Debug mode: Additional debug information
+        trackerLogger.debug(`[DEBUG] RTT History length: ${metrics.rttHistory.length}, Global History: ${this.globalRttHistory.length}`);
     }
 
     /**

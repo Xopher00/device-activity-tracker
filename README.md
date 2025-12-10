@@ -100,15 +100,32 @@ npm start
 
 Follow prompts to authenticate and enter target number.
 
+**Example Output:**
+
+```
+╔════════════════════════════════════════════════════════════════╗
+║ 🟡 Device Status Update - 09:41:51                             ║
+╠════════════════════════════════════════════════════════════════╣
+║ JID:        ***********@lid                                    ║
+║ Status:     Standby                                            ║
+║ RTT:        1104ms                                             ║
+║ Avg (3):    1161ms                                             ║
+║ Median:     1195ms                                             ║
+║ Threshold:  1075ms                                             ║
+╚════════════════════════════════════════════════════════════════╝
+```
+
+- **🟢 Online**: Device is actively being used (RTT below threshold)
+- **🟡 Standby**: Device is idle/locked (RTT above threshold)
+- **🔴 Offline**: Device is offline or unreachable (no CLIENT ACK received)
+
 ## How It Works
 
 The tracker sends reaction messages to non-existent message IDs, which triggers no notifications at the target. The time between sending the probe message and receiving the CLIENT ACK (Status 3) is measured as RTT. Device state is detected using a dynamic threshold calculated as 90% of the median RTT: values below the threshold indicate active usage, values above indicate standby mode. Measurements are stored in a history and the median is continuously updated to adapt to different network conditions.
 
-## Known Issues
+## Common Issues
 
-1. **Offline Detection Bug**: The offline detection is currently not working reliably
-
-If you have time and interest, feel free to submit a pull request to fix these issues.
+- **Not Connecting to WhatsApp**: Delete the `auth_info_baileys/` folder and re-scan the QR code.
 
 ## Project Structure
 
@@ -124,7 +141,13 @@ device-activity-tracker/
 
 ## How to Protect Yourself
 
-The most effective protection is to enable "My Contacts" in WhatsApp under Settings → Privacy → Advanced. This prevents unknown numbers from sending you messages (including silent reactions). Disabling read receipts helps with regular messages but does not protect against this specific attack. As of December 2025, this vulnerability remains exploitable in WhatsApp and Signal.
+The most effective mitigation is to enable “Block unknown account messages” in WhatsApp under
+Settings → Privacy → Advanced.
+
+This setting may reduce an attacker’s ability to spam probe reactions from unknown numbers, because WhatsApp blocks high-volume messages from unknown accounts.
+However, WhatsApp does not disclose what “high volume” means, so this does not fully prevent an attacker from sending a significant number of probe reactions before rate-limiting kicks in.
+
+Disabling read receipts helps with regular messages but does not protect against this specific attack. As of December 2025, this vulnerability remains exploitable in WhatsApp and Signal.
 
 ## Ethical & Legal Considerations
 
